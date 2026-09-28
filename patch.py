@@ -18,6 +18,18 @@ AI_LOG_FUNCTION = 'IMPORT_FIRST_PASS'
 # the import page goes through two nginx hops with 60s read timeouts, and scraping has already taken some of that
 AI_TIMEOUT_SECONDS = 45
 KNOWN_UNITS_LIMIT = 120
+COUNT_UNIT = 'ea'
+SIZE_WORDS = {'small', 'medium', 'large', 'extra-large', 'jumbo', 'big', 'whole', 'medium-size', 'standard'}
+# measuring units the model may use even if this space has never used them yet
+STANDARD_UNITS = {
+    'ea', 'each', 'cup', 'cups', 'tablespoon', 'tablespoons', 'tbsp', 'teaspoon', 'teaspoons', 'tsp', 'ounce', 'ounces', 'oz',
+    'fl oz', 'pound', 'pounds', 'lb', 'lbs', 'g', 'gram', 'grams', 'kg', 'ml', 'l', 'liter', 'liters', 'pint', 'pints',
+    'quart', 'quarts', 'gallon', 'clove', 'cloves', 'stalk', 'stalks', 'rib', 'ribs', 'sprig', 'sprigs', 'leaf', 'leaves',
+    'pinch', 'dash', 'handful', 'handfuls', 'bunch', 'bunches', 'head', 'heads', 'slice', 'slices', 'ear', 'ears',
+    'stick', 'sticks', 'piece', 'pieces', 'drop', 'drops', 'scoop', 'scoops',
+}
+CONTAINERS = ('can', 'cans', 'package', 'packages', 'jar', 'jars', 'bag', 'bags', 'box', 'boxes', 'block', 'blocks',
+              'container', 'containers', 'loaf', 'loaves', 'tub', 'tubs', 'packet', 'packets', 'bottle', 'bottles', 'portion')
 
 RULES = """You clean up ingredient lists for the Tandoor recipe manager.
 Each ingredient row has amount (number), unit, food and note. In Tandoor, amount, unit and food are shown;
@@ -29,8 +41,13 @@ Rules:
 3. "X plus Y" of the same food used at once ("1/4 cup plus 2 tablespoons vinegar"): one row, total amount in the smaller unit ("6 tablespoons"), original wording in the note.
 4. unit is a measuring unit or container: cup(s), tablespoon(s), teaspoon(s), ounce(s), pound(s), g, ml, clove(s), stalk(s), sprig(s), pinch, dash, handful, bunch, head, slices, ears, can, package...
    - Match the amount: "1 cup" but "2 cups". Prefer a name from KNOWN UNITS when one fits.
-   - Size words (small, medium, large, whole) may be the unit when there is no other unit ("2 large eggs").
-   - Never use a food, colour, variety or preparation word as the unit ("2 garlic cloves" is unit "cloves", food "garlic"; "3 celery stalks" is unit "stalks", food "celery"; "8 boneless skinless chicken thighs" has no unit).
+   - Counted items with no measuring unit use unit "ea": "2 lemons" is amount 2, unit "ea", food "lemons".
+   - Size words (small, medium, large, extra-large, whole, standard) are NEVER the unit. Put the size word first in the note:
+     "2 large eggs" is unit "ea", food "eggs", note "large"; "4 large garlic cloves" is unit "cloves", food "garlic", note "large".
+     Exception: when "whole" names the product it stays in the food ("1 whole chicken" is food "whole chicken"; "10 whole cloves" is food "whole cloves").
+   - Never use a food, colour, variety or preparation word as the unit; those belong to the food:
+     "2 garlic cloves" is unit "cloves", food "garlic"; "3 celery stalks" is unit "stalks", food "celery";
+     "3 Persian cucumbers" is unit "ea", food "Persian cucumbers"; "8 boneless skinless chicken thighs" is unit "ea", food "boneless, skinless chicken thighs".
    - A container size belongs in the unit: "1 (15-ounce) can chickpeas" is unit "15-ounce can", food "chickpeas"; "1 (2-inch) piece ginger" is unit "2-inch piece".
    - "Pinch of salt" is amount 1, unit "pinch", food "salt".
    - When amount is 0, leave the unit empty.
@@ -53,6 +70,8 @@ Examples (line text -> rows):
 "2 teaspoons (10ml) fresh juice from 1 lime" -> {"amount":2,"unit":"teaspoons","food":"lime juice","note":"10ml; fresh, from 1 lime"}
 "1/2 cup/115 grams cold unsalted butter (1 stick), cubed" -> {"amount":0.5,"unit":"cup","food":"unsalted butter","note":"115 grams (1 stick); cold, cubed"}
 "2 (14-ounce) packages extra-firm tofu, drained" -> {"amount":2,"unit":"14-ounce package","food":"extra-firm tofu","note":"drained"}
+"1 large pomegranate, seeded (about 1 cup seeds)" -> {"amount":1,"unit":"ea","food":"pomegranate","note":"large, seeded (about 1 cup seeds)"}
+"3 Persian cucumbers, quartered lengthwise" -> {"amount":3,"unit":"ea","food":"Persian cucumbers","note":"quartered lengthwise"}
 "1 cup smooth, natural peanut butter" -> {"amount":1,"unit":"cup","food":"smooth natural peanut butter","note":""}
 "2 tablespoons apple cider, rice wine or white wine vinegar" -> {"amount":2,"unit":"tablespoons","food":"apple cider vinegar","note":"or rice wine or white wine vinegar"}
 
@@ -147,12 +166,13 @@ def first_pass(request, recipe):
         if line in rejected:
             continue
         step = int(row['step']) if _is_int(row.get('step')) and 0 <= int(row['step']) < len(steps) else 0
-        unit = (row.get('unit') or '').strip()
+        amount = _amount(row.get('amount'))
+        unit, food, note = _normalize(amount, (row.get('unit') or '').strip(), food, (row.get('note') or '').strip(), known_units)
         new_steps[step].append({
-            'amount': _amount(row.get('amount')),
+            'amount': amount,
             'food': {'name': food[:128]},
             'unit': {'name': unit[:128]} if unit else None,
-            'note': (row.get('note') or '').strip()[:256],
+            'note': note[:256],
             'order': None,
             'original_text': lines[line],
         })
@@ -194,6 +214,24 @@ def _words_from(food, line):
             continue
         return False
     return True
+
+
+def _normalize(amount, unit, food, note, known_units):
+    """Enforce the unit conventions in code, whatever the model did: size words go to the note, counted items use "ea"."""
+    known = {u.lower() for u in known_units} | STANDARD_UNITS
+    low = unit.lower()
+    if low in SIZE_WORDS:
+        note = f'{low}, {note}' if note else low
+        unit = ''
+    elif unit and low not in known and not re.search(r'\d', unit) and not low.endswith(CONTAINERS):
+        # a variety or colour word the model left in the unit ("Persian", "red") belongs to the food
+        food = f'{unit} {food}'
+        unit = ''
+    if amount == 0:
+        unit = ''
+    elif not unit:
+        unit = COUNT_UNIT
+    return unit, food, note
 
 
 def _describe(ingredient):
