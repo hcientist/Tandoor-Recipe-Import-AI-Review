@@ -9,6 +9,8 @@ The first pass:
 - re-parses every ingredient line into amount / unit / food / note. For example, "½ to 1 cup heavy cream"
   becomes `0.5 cup heavy cream` with the note "½ to 1 cup; to taste". "2 garlic cloves" becomes `2 cloves garlic`,
   not unit "garlic", food "cloves".
+- gives counted items the unit `ea` and moves size words into the note: "1 large pomegranate" becomes
+  `1 ea pomegranate` with the note "large", and "3 Persian cucumbers" becomes `3 ea Persian cucumbers`.
 - keeps important details out of the note, because Tandoor only shows notes as a tooltip. Container
   sizes go into the unit (`1 15-ounce can chickpeas`), and lines that name two things to buy become two rows
   ("zest and juice of 1 lime", "cheddar and chives, for serving").
